@@ -289,6 +289,7 @@ class OverviewCommand:
                     hotwallet = argparse.Namespace()
                     hotwallet.name = nn.coldkey[:7]
                     hotwallet.hotkey_str = nn.hotkey[:7]
+
                 nn: bittensor.NeuronInfoLite
                 uid = nn.uid
                 active = nn.active
