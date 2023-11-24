@@ -358,6 +358,29 @@ class dendrite(torch.nn.Module):
         else:
             return responses
 
+    async def _network_request_and_process(self, url, synapse, timeout):
+        """
+        Helper method to perform the network request and process the response.
+
+        Args:
+            url (str): The URL for the request.
+            synapse (bittensor.Synapse): The synapse object.
+            timeout (float): The timeout for the network request.
+
+        Returns:
+            None: The method updates the synapse object in place.
+        """
+        async with (await self.session).post(
+            url,
+            headers=synapse.to_headers(),
+            json=synapse.dict(),
+            timeout=timeout,  # Timeout for the network request
+        ) as response:
+            # Extract the JSON response from the server
+            json_response = await response.json()
+            # Process the server response and fill synapse
+            self.process_server_response(response, json_response, synapse)
+
     async def call(
         self,
         target_axon: Union[bittensor.AxonInfo, bittensor.axon],
@@ -401,25 +424,22 @@ class dendrite(torch.nn.Module):
             # Log outgoing request
             self._log_outgoing_request(synapse)
 
-            # Make the HTTP POST request
-            async with (await self.session).post(
-                url,
-                headers=synapse.to_headers(),
-                json=synapse.dict(),
-                timeout=timeout,
-            ) as response:
-                # Extract the JSON response from the server
-                json_response = await response.json()
-                # Process the server response and fill synapse
-                self.process_server_response(response, json_response, synapse)
+            # Execute the network request and response processing within asyncio.wait_for
+            await asyncio.wait_for(
+                self._network_request_and_process(url, synapse, timeout), timeout
+            )
 
-            # Set process time and log the response
-            synapse.dendrite.process_time = str(time.time() - start_time)
+        except asyncio.TimeoutError:
+            # Handle timeout error
+            synapse.dendrite.status_code = "408"
+            synapse.dendrite.status_message = "Operation timed out"
 
         except Exception as e:
             self._handle_request_errors(synapse, request_name, e)
 
         finally:
+            # Set process time and log the response
+            synapse.dendrite.process_time = str(time.time() - start_time)
             self._log_incoming_response(synapse)
 
             # Log synapse event history
