@@ -18,10 +18,12 @@
 
 import os
 import copy
+import time
 import torch
 import argparse
 import bittensor
 import scalecodec
+import concurrent.futures
 
 from retry import retry
 from loguru import logger
@@ -390,17 +392,19 @@ class subtensor:
         wait_for_inclusion: bool = False,
         wait_for_finalization: bool = False,
         prompt: bool = False,
+        retry_attempts: int = 3,
+        timeout: int = 30,
     ) -> bool:
-        return set_weights_extrinsic(
-            subtensor=self,
+        return self._do_set_weights(
             wallet=wallet,
-            netuid=netuid,
             uids=uids,
-            weights=weights,
+            vals=weights,
+            netuid=netuid,
             version_key=version_key,
             wait_for_inclusion=wait_for_inclusion,
             wait_for_finalization=wait_for_finalization,
-            prompt=prompt,
+            retry_attempts=retry_attempts,
+            timeout=timeout,
         )
 
     def _do_set_weights(
@@ -412,9 +416,16 @@ class subtensor:
         version_key: int = bittensor.__version_as_int__,
         wait_for_inclusion: bool = False,
         wait_for_finalization: bool = True,
+        retry_attempts: int = 3,
+        timeout: int = 20,
+        initial_backoff: int = 5,
+        backoff_factor: int = 2,
+        max_backoff: int = 60,
     ) -> Tuple[bool, Optional[str]]:  # (success, error_message)
-        @retry(delay=2, tries=3, backoff=2, max_delay=4)
-        def make_substrate_call_with_retry():
+        attempts = 0
+        backoff_delay = initial_backoff
+
+        def submit_extrinsic_with_timeout():
             with self.substrate as substrate:
                 call = substrate.compose_call(
                     call_module="SubtensorModule",
@@ -426,7 +437,6 @@ class subtensor:
                         "version_key": version_key,
                     },
                 )
-                # Period dictates how long the extrinsic will stay as part of waiting pool
                 extrinsic = substrate.create_signed_extrinsic(
                     call=call, keypair=wallet.hotkey, era={"period": 100}
                 )
@@ -435,17 +445,51 @@ class subtensor:
                     wait_for_inclusion=wait_for_inclusion,
                     wait_for_finalization=wait_for_finalization,
                 )
-                # We only wait here if we expect finalization.
-                if not wait_for_finalization and not wait_for_inclusion:
-                    return True, None
+                return response
 
-                response.process_events()
-                if response.is_success:
-                    return True, None
-                else:
-                    return False, response.error_message
+        while attempts < retry_attempts:
+            try:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(submit_extrinsic_with_timeout)
+                    response = future.result(timeout=timeout)
 
-        return make_substrate_call_with_retry()
+                    # We only wait here if we expect finalization.
+                    if not wait_for_finalization and not wait_for_inclusion:
+                        return True
+
+                    response.process_events()
+                    if response.is_success:
+                        bittensor.__console__.print(
+                            ":white_heavy_check_mark: [green]Finalized[/green]"
+                        )
+                        bittensor.logging.success(
+                            f"Set weights successful on netuid {netuid}."
+                        )
+                        return True
+                    else:
+                        bittensor.__console__.print(
+                            f":cross_mark: [red]Failed[/red]: error: {str(response.error_message)}"
+                        )
+                        bittensor.logging.error(
+                            f"Set weights {str(response.error_message)}"
+                        )
+
+            except concurrent.futures.TimeoutError:
+                logger.error(f"Timeout reached for set_weights after {timeout} seconds")
+
+            except Exception as e:
+                time.sleep(backoff_delay)
+                backoff_delay = min(backoff_delay * backoff_factor, max_backoff)
+                logger.error(f"Error in set_weights: {str(e)}")
+
+            attempts += 1
+            if attempts >= retry_attempts:
+                bittensor.__console__.print(
+                    f":cross_mark: [red]Failed[/red]: error: Timeout reached for set_weights after {retry_attempts} attempts"
+                )
+                return False
+
+        return False
 
     ######################
     #### Registration ####
